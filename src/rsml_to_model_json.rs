@@ -157,7 +157,12 @@ fn resolve_derive(
     let mut path = resolve_derive_alias(content, current_path, luaurc);
     path.set_extension("rsml");
 
-    match path.canonicalize() {
+    // Patched: use dunce::canonicalize to match the canonicalization done on
+    // input_dir (see main.rs). std::path::Path::canonicalize on Windows returns
+    // \\?\-prefixed extended paths, which then fail strip_prefix(input_dir)
+    // because input_dir is canonicalized via dunce (no \\?\ prefix). See
+    // rsml_to_model_json.rs:268 unwrap panic on Windows.
+    match dunce::canonicalize(&path) {
         Ok(canonicalized) => {
             if &canonicalized == current_path {
                 None

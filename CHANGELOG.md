@@ -1,3 +1,11 @@
+# v0.0.18-fork.1
+## Fixes
+- Fixed crash on Windows where `@derive` paths weren't canonicalized to match
+  `input_dir`, causing a `StripPrefixError` panic in
+  `rsml_to_model_json.rs::resolve_derive`. Same root cause as the v0.0.16 watch
+  fix (`std::path::Path::canonicalize` adds a `\\?\` extended-length prefix
+  that `dunce::canonicalize` does not), now applied to the build path as well.
+
 # v0.0.18
 ## Features
 - Upgraded `rbx-rsml` version:
