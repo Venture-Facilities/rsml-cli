@@ -1,3 +1,9 @@
+# v0.0.18-fork.2
+## Features
+- Imports root-level `$!` static tokens from derived stylesheets at build time,
+  allowing themes to derive shared token sheets like `colors.rsml` without
+  duplicating static palettes inline.
+
 # v0.0.18-fork.1
 ## Fixes
 - Fixed crash on Windows where `@derive` paths weren't canonicalized to match

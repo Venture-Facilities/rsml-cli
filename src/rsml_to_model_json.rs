@@ -1,11 +1,12 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
 };
 
 use rbx_rsml::{
-    RsmlCompiler, RsmlParser, compiler::tree_node::CompiledRsml, lexer::Token, parser::Construct,
+    RsmlCompiler, RsmlParser, compiler::tree_node::CompiledRsml, datatype::Datatype, lexer::Token,
+    parser::Construct,
 };
 use rbx_types::{Attributes, Variant};
 use serde::{Deserialize, Serialize, Serializer, ser::SerializeStruct};
@@ -244,6 +245,56 @@ fn track_derive_dependencies(
     watcher.dependencies.insert(path.to_path_buf(), derive_path);
 }
 
+fn collect_static_attributes_for_derives(
+    derive_strings: &[String],
+    current_path: &Path,
+    watcher: &mut WatcherContext,
+    already_collected: &mut HashSet<PathBuf>,
+) -> HashMap<String, Datatype> {
+    let mut static_attributes = HashMap::new();
+
+    for derive in derive_strings {
+        let derive_path = guarded_unwrap!(
+            resolve_derive(derive, current_path, watcher.luaurc.as_mut()),
+            continue
+        );
+
+        static_attributes.extend(collect_static_attributes_from_derive(
+            &derive_path,
+            watcher,
+            already_collected,
+        ));
+    }
+
+    static_attributes
+}
+
+fn collect_static_attributes_from_derive(
+    derive_path: &Path,
+    watcher: &mut WatcherContext,
+    already_collected: &mut HashSet<PathBuf>,
+) -> HashMap<String, Datatype> {
+    if !already_collected.insert(derive_path.to_path_buf()) {
+        return HashMap::new();
+    }
+
+    let content = guarded_unwrap!(fs::read_to_string(derive_path), return HashMap::new());
+    let derive_strings = extract_derive_paths(&content);
+    let inherited_static_attributes = collect_static_attributes_for_derives(
+        &derive_strings,
+        derive_path,
+        watcher,
+        already_collected,
+    );
+    let mut compiled =
+        RsmlCompiler::from_source_with_static_attributes(&content, inherited_static_attributes);
+
+    compiled
+        .take_root()
+        .map(|root| root.static_attributes)
+        .unwrap_or_default()
+}
+
 pub fn rsml_to_model_json(path: &Path, watcher: &mut WatcherContext) -> String {
     let content = fs::read_to_string(path).unwrap();
 
@@ -278,7 +329,10 @@ pub fn rsml_to_model_json(path: &Path, watcher: &mut WatcherContext) -> String {
         })
         .collect::<Vec<Child>>();
 
-    let mut compiled = RsmlCompiler::from_source(&content);
+    let inherited_static_attributes =
+        collect_static_attributes_for_derives(&derive_strings, path, watcher, &mut HashSet::new());
+    let mut compiled =
+        RsmlCompiler::from_source_with_static_attributes(&content, inherited_static_attributes);
 
     let rsml_root = compiled.take_root().unwrap();
 

@@ -702,4 +702,45 @@ mod tests {
         // Clean up.
         let _ = fs::remove_dir_all(&temp);
     }
+
+    #[test]
+    fn build_imports_static_tokens_from_derives() {
+        let temp = std::env::temp_dir().join("rsml_test_static_derive");
+        let input = temp.join("src");
+        let output = temp.join("out");
+        let styles = input.join("styles");
+        let themes = input.join("themes");
+
+        let _ = fs::remove_dir_all(&temp);
+        fs::create_dir_all(&styles).unwrap();
+        fs::create_dir_all(&themes).unwrap();
+        fs::create_dir_all(&output).unwrap();
+
+        fs::write(
+            styles.join("colors.rsml"),
+            "$!Blue = color3(0.3, 0.6, 0.8);",
+        )
+        .unwrap();
+        fs::write(
+            themes.join("Venture.rsml"),
+            "@derive \"../styles/colors\";\n$BrandPrimary = $!Blue;",
+        )
+        .unwrap();
+
+        let vfs = Vfs::new(StdBackend::new());
+        let mut context = WatcherContext::new(vfs, &input, &output, None);
+        context.initialize();
+
+        let model_json_path = output.join("themes").join("Venture.model.json");
+        let content: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&model_json_path).unwrap()).unwrap();
+
+        assert!(
+            !content["attributes"]["BrandPrimary"].is_null(),
+            "expected BrandPrimary to resolve from the derived static token"
+        );
+        assert_eq!(content["children"][0]["className"], "StyleDerive");
+
+        let _ = fs::remove_dir_all(&temp);
+    }
 }
