@@ -1,3 +1,15 @@
+# v0.0.18-fork.3
+## Fixes
+- `build` and watch rescans no longer delete all outputs before they write them
+  again. The scan writes each output first and then removes only stale outputs.
+  Rojo no longer logs `$path` errors for missing `.model.json` files during a
+  rebuild.
+- Outputs are written to a temp file and then renamed, so a watcher never reads
+  an empty or partial file. Outputs with no change are not written.
+- In-place builds (no `--output`) no longer delete outputs that the same scan
+  generated.
+- A directory created in watch mode now scans the correct output folder.
+
 # v0.0.18-fork.2
 ## Features
 - Imports root-level `$!` static tokens from derived stylesheets at build time,

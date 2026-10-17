@@ -1,6 +1,6 @@
 [package]
 name = "rsml-cli"
-version = "0.0.18-fork.2"
+version = "0.0.18-fork.3"
 edition = "2024"
 
 [dependencies]

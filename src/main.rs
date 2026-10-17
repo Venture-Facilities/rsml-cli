@@ -11,7 +11,7 @@ use serde::Deserialize;
 
 use std::{
     collections::HashSet,
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     fs,
     io::{Write, stdout},
     path::{Path, PathBuf},
@@ -40,6 +40,34 @@ pub struct ModelJsonId {
 enum CreateFileDependencies<'a> {
     True(Option<&'a Path>),
     False,
+}
+
+// Watchers such as Rojo must never see an output missing or half written, so
+// the new contents go to a sibling temp file that replaces the output in one
+// rename. Identical contents are skipped to avoid needless watcher churn.
+fn write_atomic_if_changed(path: &Path, contents: &str) -> std::io::Result<()> {
+    if fs::read(path).is_ok_and(|existing| existing == contents.as_bytes()) {
+        return Ok(());
+    }
+
+    let mut temp_name = OsString::from(".");
+    temp_name.push(path.file_name().unwrap_or_default());
+    temp_name.push(".tmp");
+    let temp_path = path.with_file_name(temp_name);
+
+    fs::write(&temp_path, contents)?;
+
+    // On Windows a reader without delete sharing (antivirus, indexers) blocks
+    // the rename for a moment.
+    for _ in 0..5 {
+        if fs::rename(&temp_path, path).is_ok() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let _ = fs::remove_file(&temp_path);
+    fs::write(path, contents)
 }
 
 fn model_json_is_rsml(path: &Path) -> bool {
@@ -91,7 +119,9 @@ impl WatcherContext {
                 self.luaurc_update(luaurc_path.clone());
             }
         } else if path.is_dir() {
-            self.recursive_scan(&path);
+            if let Ok(offset_dir) = path.strip_prefix(&self.input_dir) {
+                self.recursive_scan(&offset_dir.to_path_buf());
+            }
 
         // path no longer exists, remove it (the Remove event can't be relied upon).
         } else {
@@ -123,8 +153,8 @@ impl WatcherContext {
         }
     }
 
-    fn create_file(&mut self, path: &Path, create_dependencies: CreateFileDependencies) {
-        let output_path = &{
+    fn create_file(&mut self, path: &Path, create_dependencies: CreateFileDependencies) -> PathBuf {
+        let output_path = {
             let mut output_path = self
                 .output_dir
                 .join(path.strip_prefix(&self.input_dir).unwrap());
@@ -135,11 +165,12 @@ impl WatcherContext {
         let _ = fs::create_dir_all(&output_path.parent().unwrap());
 
         let model_json = rsml_to_model_json(&path, self);
-        fs::write(output_path, model_json).unwrap();
+        write_atomic_if_changed(&output_path, &model_json).unwrap();
 
         match create_dependencies {
             CreateFileDependencies::True(referent_path) => {
-                let dependants = guarded_unwrap!(self.dependencies.get_by_right(path), return);
+                let dependants =
+                    guarded_unwrap!(self.dependencies.get_by_right(path), return output_path);
 
                 if let Some(referent_path) = referent_path {
                     for dependant in dependants.clone() {
@@ -158,6 +189,8 @@ impl WatcherContext {
 
             CreateFileDependencies::False => (),
         };
+
+        output_path
     }
 
     fn luaurc_update(&mut self, luaurc_path: PathBuf) {
@@ -238,21 +271,22 @@ impl WatcherContext {
         self.recursive_scan(&PathBuf::new());
     }
 
+    // Writes every output before it removes stale ones, so a valid output is
+    // never deleted only to be written again.
     fn recursive_scan(&mut self, offset_dir: &PathBuf) {
-        if self.input_dir == self.output_dir {
-            let offset_input_dir = &self.input_dir.join(offset_dir).normalize();
+        let offset_input_dir = self.input_dir.join(offset_dir).normalize();
+        let offset_output_dir = self.output_dir.join(offset_dir).normalize();
 
-            self.recursive_scan_create_and_clean(self.vfs.read_dir(offset_input_dir));
-        } else {
-            let offset_input_dir = &self.input_dir.join(offset_dir).normalize();
-            let offset_output_dir = &self.output_dir.join(offset_dir).normalize();
-
-            self.recursive_scan_clean(self.vfs.read_dir(offset_output_dir));
-            self.recursive_scan_create(self.vfs.read_dir(offset_input_dir));
-        }
+        let mut generated = HashSet::new();
+        self.recursive_scan_create(self.vfs.read_dir(offset_input_dir), &mut generated);
+        self.recursive_scan_clean(self.vfs.read_dir(offset_output_dir), &generated);
     }
 
-    fn recursive_scan_create_and_clean(&mut self, dir: Result<ReadDir, std::io::Error>) {
+    fn recursive_scan_create(
+        &mut self,
+        dir: Result<ReadDir, std::io::Error>,
+        generated: &mut HashSet<PathBuf>,
+    ) {
         let dir = guarded_unwrap!(dir, return);
 
         for entry in dir {
@@ -260,46 +294,25 @@ impl WatcherContext {
 
             // Applies files for all of the directories descendants.
             if path.is_dir() {
-                self.recursive_scan_create_and_clean(self.vfs.read_dir(path));
-            } else if path.is_file() {
-                // Creates the .model.json for the current .rsml file.
-                if path.extension() == Some(OsStr::new("rsml")) {
-                    self.create_file(
-                        &dunce::canonicalize(&path).unwrap(),
-                        CreateFileDependencies::False,
-                    );
-
-                // Deletes .model.json file if it represents rsml as its considered stale.
-                } else if path.to_string_lossy().ends_with(".model.json")
-                    && model_json_is_rsml(path)
-                {
-                    let _ = fs::remove_file(path);
-                }
-            }
-        }
-    }
-
-    fn recursive_scan_create(&mut self, dir: Result<ReadDir, std::io::Error>) {
-        let dir = guarded_unwrap!(dir, return);
-
-        for entry in dir {
-            let path = guarded_unwrap!(&entry, continue).path();
-
-            // Applies files for all of the directories descendants.
-            if path.is_dir() {
-                self.recursive_scan_create(self.vfs.read_dir(path));
+                self.recursive_scan_create(self.vfs.read_dir(path), generated);
 
             // Creates the .model.json for the current .rsml file.
             } else if path.is_file() && path.extension() == Some(OsStr::new("rsml")) {
-                self.create_file(
+                generated.insert(self.create_file(
                     &dunce::canonicalize(&path).unwrap(),
                     CreateFileDependencies::False,
-                );
+                ));
             }
         }
     }
 
-    fn recursive_scan_clean(&mut self, dir: Result<ReadDir, std::io::Error>) {
+    // Removes .model.json files that represent rsml but were not generated by
+    // this scan, as they are stale.
+    fn recursive_scan_clean(
+        &mut self,
+        dir: Result<ReadDir, std::io::Error>,
+        generated: &HashSet<PathBuf>,
+    ) {
         let dir = guarded_unwrap!(dir, return);
 
         for entry in dir {
@@ -307,11 +320,10 @@ impl WatcherContext {
 
             // Applies files for all of the directories descendants.
             if path.is_dir() {
-                self.recursive_scan_clean(self.vfs.read_dir(path));
-
-            // Removes the .model.json file.
+                self.recursive_scan_clean(self.vfs.read_dir(path), generated);
             } else if path.is_file()
                 && path.to_string_lossy().ends_with(".model.json")
+                && !generated.contains(path)
                 && model_json_is_rsml(path)
             {
                 let _ = fs::remove_file(path);
@@ -740,6 +752,68 @@ mod tests {
             "expected BrandPrimary to resolve from the derived static token"
         );
         assert_eq!(content["children"][0]["className"], "StyleDerive");
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn rebuild_keeps_unchanged_outputs_and_removes_stale_ones() {
+        let temp = std::env::temp_dir().join("rsml_test_rebuild");
+        let input = temp.join("src");
+        let output = temp.join("out");
+
+        let _ = fs::remove_dir_all(&temp);
+        fs::create_dir_all(&input).unwrap();
+        fs::create_dir_all(&output).unwrap();
+
+        fs::write(input.join("kept.rsml"), "").unwrap();
+        fs::write(input.join("removed.rsml"), "").unwrap();
+
+        let build = || {
+            let vfs = Vfs::new(StdBackend::new());
+            WatcherContext::new(vfs, &input, &output, None).initialize();
+        };
+
+        build();
+        let kept = output.join("kept.model.json");
+        let kept_modified = fs::metadata(&kept).unwrap().modified().unwrap();
+
+        fs::remove_file(input.join("removed.rsml")).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        build();
+
+        assert_eq!(
+            fs::metadata(&kept).unwrap().modified().unwrap(),
+            kept_modified,
+            "an unchanged output must not be rewritten"
+        );
+        assert!(!output.join("removed.model.json").exists());
+        assert!(
+            fs::read_dir(&output)
+                .unwrap()
+                .all(|entry| !entry.unwrap().file_name().to_string_lossy().ends_with(".tmp")),
+            "temp files must not be left behind"
+        );
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn in_place_build_keeps_outputs() {
+        let temp = std::env::temp_dir().join("rsml_test_in_place");
+
+        let _ = fs::remove_dir_all(&temp);
+        fs::create_dir_all(&temp).unwrap();
+        fs::write(temp.join("a.rsml"), "").unwrap();
+        fs::write(temp.join("b.rsml"), "").unwrap();
+
+        for _ in 0..2 {
+            let vfs = Vfs::new(StdBackend::new());
+            WatcherContext::new(vfs, &temp, &temp, None).initialize();
+        }
+
+        assert!(temp.join("a.model.json").exists());
+        assert!(temp.join("b.model.json").exists());
 
         let _ = fs::remove_dir_all(&temp);
     }
